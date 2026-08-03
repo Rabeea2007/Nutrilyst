@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+
+# Android build outputs & local config
+android/app/build/
+android/.gradle/
+android/local.properties
+android/captures/
+android/.idea/
+
+# Environment variables
+.env
+.env.local
+
+# Operating System files
+.DS_Store
+Thumbs.db

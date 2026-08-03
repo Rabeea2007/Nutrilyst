@@ -1,0 +1,10 @@
+{
+  "description": "This app personalizes health and dietary choices by scanning products for allergens and conditions, helping users make safer food decisions.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
