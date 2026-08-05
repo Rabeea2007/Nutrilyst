@@ -1,21 +1,18 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { Html5Qrcode } from 'html5-qrcode'
-import { createWorker } from 'tesseract.js'
 import { Camera } from '@capacitor/camera'
 import { Toast } from '@capacitor/toast'
 import { fetchProductByBarcode, type ScannedProduct } from './services/productApi'
 import { evaluateProductHealth } from './utils/healthEvaluator'
-import { extractExpiryDate } from './utils/dateParser'
 import { fetchPantryRecipes, type AIRecipe as PantryAIRecipe } from './utils/recipeEngine'
 import { generateShoppingList, shareShoppingList, type ShoppingItem } from './utils/shoppingListEngine'
 import { generateAutomaticRecipe, type AIRecipe } from './services/aiRecipeService'
-import { loadUserProfile, saveUserProfile, type UserProfile } from './services/profileService'
+import { loadUserProfile, saveUserProfile, getProfileFlags, type UserProfile } from './services/profileService'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Screen = 'dashboard' | 'profile' | 'scanner' | 'verdict' | 'pantry' | 'recipes' | 'shopping-list' | 'automatic-recipes' | 'add-item'
 type VerdictVariant = 'avoid' | 'moderation' | 'safe'
-type ScannerMode = 'barcode' | 'expiry'
 type PantryFilter = 'all' | 'perishable' | 'daily' | 'occasional'
 type StorageCategory = 'PERISHABLE' | 'NON_PERISHABLE'
 type UsageFrequency = 'DAILY' | 'OCCASIONAL'
@@ -232,11 +229,25 @@ function ChipGroup({ label, chips, selected, onToggle }: { label: string; chips:
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
-function DashboardScreen({ items, onNav }: { items: PantryItem[]; onNav: (s: Screen) => void }) {
+function DashboardScreen({ items, onNav, userName, scansToday }: {
+  items: PantryItem[]
+  onNav: (s: Screen) => void
+  userName: string
+  scansToday: number
+}) {
   const urgent = items.filter((i) => i.expiryLevel === 'urgent')
   const moderate = items.filter((i) => i.expiryLevel === 'moderate')
   const safeCount = items.filter((i) => i.expiryLevel === 'safe').length
   const pantryScore = items.length > 0 ? Math.round((safeCount / items.length) * 100) : 100
+
+  // Items saved = items added beyond the initial pantry (new scanned items added)
+  const itemsSaved = Math.max(0, items.length - INITIAL_PANTRY.length)
+
+  // Live date and greeting
+  const now = new Date()
+  const hour = now.getHours()
+  const greeting = hour < 12 ? 'GOOD MORNING' : hour < 17 ? 'GOOD AFTERNOON' : 'GOOD EVENING'
+  const dateStr = now.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short', year: 'numeric' })
 
   const ACTIONS = [
     { label: 'Scan Product', icon: '📷', screen: 'scanner' as Screen, bg: 'bg-emerald-800', text: 'text-white' },
@@ -246,14 +257,14 @@ function DashboardScreen({ items, onNav }: { items: PantryItem[]; onNav: (s: Scr
   ]
 
   return (
-    <div className="flex flex-col h-full bg-[#F2F4F3] overflow-y-auto">
+    <div className="flex flex-col h-full bg-[#F2F4F3] overflow-y-auto pt-safe">
       {/* Hero header */}
       <div className="px-5 pt-4 pb-6" style={{ background: 'linear-gradient(145deg, #064e3b 0%, #065f46 50%, #0f2720 100%)' }}>
         <div className="flex items-start justify-between mb-5">
           <div>
-            <p className="text-emerald-400 text-xs font-mono mb-1">GOOD EVENING</p>
-            <h1 className="text-white text-2xl font-bold leading-tight">USER</h1>
-            <p className="text-emerald-300/70 text-xs mt-0.5">Sunday, 2 Aug 2026</p>
+            <p className="text-emerald-400 text-xs font-mono mb-1">{greeting}</p>
+            <h1 className="text-white text-2xl font-bold leading-tight">{userName}</h1>
+            <p className="text-emerald-300/70 text-xs mt-0.5">{dateStr}</p>
           </div>
           <div className="bg-white/10 rounded-2xl px-3 py-2 text-center border border-white/10">
             <p className="text-[9px] font-mono text-emerald-400 mb-1 tracking-widest">PANTRY HEALTH</p>
@@ -266,7 +277,7 @@ function DashboardScreen({ items, onNav }: { items: PantryItem[]; onNav: (s: Scr
           {[
             { label: 'Total Items', val: items.length, color: 'text-white' },
             { label: 'Expiring Soon', val: urgent.length + moderate.length, color: 'text-amber-400' },
-            { label: 'Scans Today', val: 3, color: 'text-emerald-400' },
+            { label: 'Scans Today', val: scansToday, color: 'text-emerald-400' },
           ].map(({ label, val, color }) => (
             <div key={label} className="bg-white/10 rounded-xl px-3 py-2.5 border border-white/10">
               <p className={`text-xl font-bold font-mono ${color}`}>{val}</p>
@@ -362,9 +373,52 @@ function DashboardScreen({ items, onNav }: { items: PantryItem[]; onNav: (s: Scr
 
 // ─── Profile ──────────────────────────────────────────────────────────────────
 
-function ProfileScreen() {
+function ProfileScreen({ pantryItemCount, scansTotal }: { pantryItemCount: number; scansTotal: number }) {
   const [profile, setProfile] = useState<UserProfile>(loadUserProfile)
   const [savedMessage, setSavedMessage] = useState(false)
+  const [editingName, setEditingName] = useState(false)
+  const [nameInput, setNameInput] = useState(profile.name)
+
+  // Live-computed stats
+  const itemsSaved = Math.max(0, pantryItemCount - INITIAL_PANTRY.length)
+  const wastePreventedKg = +(itemsSaved * 0.3).toFixed(1)  // rough 300g per saved item
+
+  const DIET_OPTIONS = [
+    { label: 'Vegetarian', emoji: '🥦' },
+    { label: 'Vegan', emoji: '🌱' },
+    { label: 'Halal', emoji: '☪️' },
+    { label: 'Kosher', emoji: '✡️' },
+    { label: 'Keto', emoji: '🥑' },
+    { label: 'Paleo', emoji: '🍖' },
+    { label: 'Gluten-Free', emoji: '🌾' },
+    { label: 'Dairy-Free', emoji: '🥛' },
+    { label: 'Low-Carb', emoji: '🍞' },
+    { label: 'Low-Sodium', emoji: '🧂' },
+  ]
+
+  const ALLERGY_OPTIONS = [
+    { label: 'Peanuts', emoji: '🥜' },
+    { label: 'Tree Nuts', emoji: '🌰' },
+    { label: 'Gluten / Wheat', emoji: '🌾' },
+    { label: 'Dairy / Lactose', emoji: '🧈' },
+    { label: 'Soy', emoji: '🫘' },
+    { label: 'Shellfish', emoji: '🦐' },
+    { label: 'Eggs', emoji: '🥚' },
+    { label: 'Fish', emoji: '🐟' },
+    { label: 'Sesame', emoji: '🫙' },
+    { label: 'Sulphites', emoji: '🍷' },
+  ]
+
+  const CONDITION_OPTIONS = [
+    { label: 'Diabetes (Type 2)', emoji: '🩸' },
+    { label: 'Hypertension', emoji: '❤️' },
+    { label: 'PCOS', emoji: '🌸' },
+    { label: 'IBS / Low-FODMAP', emoji: '🫶' },
+    { label: 'Kidney Care', emoji: '💧' },
+    { label: 'High Cholesterol', emoji: '🫀' },
+    { label: 'Celiac Disease', emoji: '🌾' },
+    { label: 'Thyroid', emoji: '⚡' },
+  ]
 
   const handleUpdate = <K extends keyof UserProfile>(key: K, value: UserProfile[K]) => {
     const updated = { ...profile, [key]: value }
@@ -374,147 +428,263 @@ function ProfileScreen() {
     setTimeout(() => setSavedMessage(false), 2000)
   }
 
+  const toggleItem = (key: 'dietaryPreferences' | 'allergies' | 'healthConditions', item: string) => {
+    const current: string[] = profile[key] as string[]
+    const updated = current.includes(item)
+      ? current.filter((x) => x !== item)
+      : [...current, item]
+    handleUpdate(key, updated)
+  }
+
+  const saveName = () => {
+    if (nameInput.trim()) handleUpdate('name', nameInput.trim())
+    setEditingName(false)
+  }
+
+  const totalFlags = profile.dietaryPreferences.length + profile.allergies.length + profile.healthConditions.length
+
   return (
-    <div className="flex flex-col h-full bg-[#F7FAF8]">
-      <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-4 pt-safe">
-        <p className="text-[10px] font-mono tracking-widest text-emerald-600 mb-0.5">
-          PERSONAL SETTINGS
-        </p>
+    <div className="flex flex-col h-full bg-[#F7FAF8] pt-safe">
+      {/* Header */}
+      <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-4">
+        <p className="text-[10px] font-mono tracking-widest text-emerald-600 mb-0.5">MY PROFILE</p>
         <div className="flex items-center justify-between">
-          <h1 className="text-xl font-bold text-gray-900">User Profile</h1>
+          <h1 className="text-xl font-bold text-gray-900">Health Profile</h1>
           {savedMessage && (
-            <span className="text-[11px] font-mono bg-emerald-100 text-emerald-800 px-2.5 py-1 rounded-full animate-fade-in font-semibold">
-              ✓ Saved!
+            <span className="text-[11px] font-mono bg-emerald-100 text-emerald-800 px-2.5 py-1 rounded-full font-semibold">
+              ✓ Saved
             </span>
           )}
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4 pb-safe">
-        <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-xs flex items-center gap-4">
-          <div className="w-14 h-14 rounded-full bg-gradient-to-tr from-emerald-600 to-teal-400 text-white font-bold text-xl flex items-center justify-center shadow-md">
-            {profile.name.charAt(0)}
-          </div>
-          <div className="flex-1">
-            <h2 className="text-base font-bold text-gray-900">{profile.name}</h2>
-            <p className="text-xs text-gray-500">{profile.email}</p>
-            <span className="mt-1.5 inline-block text-[10px] font-mono bg-emerald-50 text-emerald-700 px-2.5 py-0.5 rounded-md border border-emerald-200 font-semibold">
-              🌱 Zero-Waste Champion
-            </span>
+
+        {/* Identity card */}
+        <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-xs">
+          <div className="flex items-center gap-4">
+            <div className="w-14 h-14 rounded-full bg-gradient-to-tr from-emerald-600 to-teal-400 text-white font-bold text-xl flex items-center justify-center shadow-md shrink-0">
+              {profile.name.charAt(0).toUpperCase()}
+            </div>
+            <div className="flex-1 min-w-0">
+              {editingName ? (
+                <div className="flex items-center gap-2">
+                  <input
+                    autoFocus
+                    value={nameInput}
+                    onChange={(e) => setNameInput(e.target.value)}
+                    onBlur={saveName}
+                    onKeyDown={(e) => e.key === 'Enter' && saveName()}
+                    className="flex-1 text-base font-bold text-gray-900 bg-transparent border-b-2 border-emerald-500 outline-none py-0.5"
+                  />
+                  <button onClick={saveName} className="text-emerald-600 text-xs font-semibold">Save</button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <h2 className="text-base font-bold text-gray-900">{profile.name}</h2>
+                  <button onClick={() => { setNameInput(profile.name); setEditingName(true) }}
+                    className="text-[11px] text-gray-400 border border-gray-200 rounded-md px-1.5 py-0.5 hover:border-emerald-400 hover:text-emerald-600 transition-colors">
+                    ✏️ Edit
+                  </button>
+                </div>
+              )}
+              <p className="text-[10px] text-gray-400 mt-0.5">Tap ✏️ to edit your name</p>
+              <div className="flex items-center gap-1.5 mt-1.5">
+                <span className="text-[10px] font-mono bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded-md border border-emerald-100">
+                  🌱 Zero-Waste Champion
+                </span>
+                {totalFlags > 0 && (
+                  <span className="text-[10px] font-mono bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md border border-blue-100">
+                    {totalFlags} active flag{totalFlags > 1 ? 's' : ''}
+                  </span>
+                )}
+              </div>
+            </div>
           </div>
         </div>
 
-        <div className="bg-gradient-to-r from-emerald-900 to-emerald-700 rounded-2xl p-4 text-white shadow-sm space-y-2">
-          <p className="text-[10px] font-mono uppercase tracking-widest text-emerald-200">
-            Impact Dashboard
-          </p>
-          <div className="grid grid-cols-3 gap-2 pt-1">
+        {/* How it works callout */}
+        <div className="bg-emerald-50 border border-emerald-100 rounded-2xl px-4 py-3 flex gap-3 items-start">
+          <span className="text-xl shrink-0">💡</span>
+          <div>
+            <p className="text-xs font-semibold text-emerald-800">How your profile protects you</p>
+            <p className="text-[11px] text-emerald-700 mt-0.5 leading-relaxed">
+              Every item you select below is checked against scanned products. Matches trigger warnings on the Result screen so you never accidentally buy something harmful.
+            </p>
+          </div>
+        </div>
+
+        {/* ── Dietary Preferences ── */}
+        <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-xs space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-bold text-gray-900">🥗 Dietary Preferences</h3>
+              <p className="text-[11px] text-gray-400 mt-0.5">Your eating style — affects recipe suggestions</p>
+            </div>
+            {profile.dietaryPreferences.length > 0 && (
+              <span className="text-[10px] font-mono bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full">
+                {profile.dietaryPreferences.length} selected
+              </span>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {DIET_OPTIONS.map(({ label, emoji }) => {
+              const on = profile.dietaryPreferences.includes(label)
+              return (
+                <button key={label} onClick={() => toggleItem('dietaryPreferences', label)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-all active:scale-95 ${
+                    on ? 'bg-emerald-600 text-white border-emerald-600 shadow-sm' : 'bg-gray-50 text-gray-600 border-gray-200'
+                  }`}>
+                  <span>{emoji}</span><span>{label}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
+        {/* ── Allergies ── */}
+        <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-xs space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-bold text-gray-900">⚠️ Allergies &amp; Intolerances</h3>
+              <p className="text-[11px] text-gray-400 mt-0.5">Scanned products will be flagged if these are detected</p>
+            </div>
+            {profile.allergies.length > 0 && (
+              <span className="text-[10px] font-mono bg-red-100 text-red-700 px-2 py-0.5 rounded-full">
+                {profile.allergies.length} selected
+              </span>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {ALLERGY_OPTIONS.map(({ label, emoji }) => {
+              const on = profile.allergies.includes(label)
+              return (
+                <button key={label} onClick={() => toggleItem('allergies', label)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-all active:scale-95 ${
+                    on ? 'bg-red-500 text-white border-red-500 shadow-sm' : 'bg-gray-50 text-gray-600 border-gray-200'
+                  }`}>
+                  <span>{emoji}</span><span>{label}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
+        {/* ── Health Conditions ── */}
+        <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-xs space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-bold text-gray-900">🩺 Health Conditions</h3>
+              <p className="text-[11px] text-gray-400 mt-0.5">Nutrients &amp; ingredients are evaluated against these</p>
+            </div>
+            {profile.healthConditions.length > 0 && (
+              <span className="text-[10px] font-mono bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">
+                {profile.healthConditions.length} selected
+              </span>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {CONDITION_OPTIONS.map(({ label, emoji }) => {
+              const on = profile.healthConditions.includes(label)
+              return (
+                <button key={label} onClick={() => toggleItem('healthConditions', label)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-all active:scale-95 ${
+                    on ? 'bg-amber-500 text-white border-amber-500 shadow-sm' : 'bg-gray-50 text-gray-600 border-gray-200'
+                  }`}>
+                  <span>{emoji}</span><span>{label}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
+        {/* ── Household & Settings ── */}
+        <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-xs space-y-3">
+          <h3 className="text-sm font-bold text-gray-900">⚙️ Preferences</h3>
+
+          {/* Household size */}
+          <div className="flex items-center justify-between py-1">
+            <div>
+              <p className="text-xs font-semibold text-gray-800">Household Size</p>
+              <p className="text-[11px] text-gray-400">Scales recipe ingredient quantities</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={() => handleUpdate('householdSize', Math.max(1, profile.householdSize - 1))}
+                className="w-8 h-8 rounded-xl bg-gray-100 text-gray-700 font-bold text-base flex items-center justify-center active:scale-95">−</button>
+              <span className="text-sm font-mono font-bold w-5 text-center text-gray-900">{profile.householdSize}</span>
+              <button onClick={() => handleUpdate('householdSize', profile.householdSize + 1)}
+                className="w-8 h-8 rounded-xl bg-gray-100 text-gray-700 font-bold text-base flex items-center justify-center active:scale-95">+</button>
+            </div>
+          </div>
+
+          {/* Expiry alert */}
+          <div className="flex items-center justify-between border-t border-gray-50 pt-3">
+            <div>
+              <p className="text-xs font-semibold text-gray-800">Expiry Alert Buffer</p>
+              <p className="text-[11px] text-gray-400">Warn when items expire within this window</p>
+            </div>
+            <select value={profile.expiryAlertDays}
+              onChange={(e) => handleUpdate('expiryAlertDays', Number(e.target.value))}
+              className="bg-gray-50 border border-gray-200 rounded-xl py-1.5 px-3 text-xs text-gray-800 font-mono focus:outline-none">
+              <option value={1}>1 Day</option>
+              <option value={2}>2 Days</option>
+              <option value={3}>3 Days</option>
+              <option value={5}>5 Days</option>
+              <option value={7}>1 Week</option>
+            </select>
+          </div>
+
+          {/* Measurement system */}
+          <div className="flex items-center justify-between border-t border-gray-50 pt-3">
+            <div>
+              <p className="text-xs font-semibold text-gray-800">Measurement System</p>
+              <p className="text-[11px] text-gray-400">Used for recipes &amp; quantities</p>
+            </div>
+            <select value={profile.metricSystem}
+              onChange={(e) => handleUpdate('metricSystem', e.target.value as UserProfile['metricSystem'])}
+              className="bg-gray-50 border border-gray-200 rounded-xl py-1.5 px-3 text-xs text-gray-800 font-mono focus:outline-none">
+              <option value="Metric (g, ml)">Metric</option>
+              <option value="Imperial (oz, cups)">Imperial</option>
+            </select>
+          </div>
+        </div>
+
+        {/* Active flags summary */}
+        {totalFlags > 0 && (
+          <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-xs">
+            <h3 className="text-xs font-mono font-bold text-gray-400 uppercase tracking-wider mb-3">
+              Active Scan Flags ({totalFlags})
+            </h3>
+            <div className="flex flex-wrap gap-1.5">
+              {getProfileFlags(profile).map((flag) => (
+                <span key={flag} className="text-[11px] font-mono bg-gray-900 text-white px-2.5 py-1 rounded-full">
+                  {flag}
+                </span>
+              ))}
+            </div>
+            <p className="text-[10px] text-gray-400 mt-2.5">These are checked against every scanned product.</p>
+          </div>
+        )}
+
+        {/* Impact stats */}
+        <div className="bg-gradient-to-r from-emerald-900 to-emerald-700 rounded-2xl p-4 text-white shadow-sm">
+          <p className="text-[10px] font-mono uppercase tracking-widest text-emerald-200 mb-2">Impact Dashboard</p>
+          <div className="grid grid-cols-3 gap-2">
             <div className="bg-white/10 rounded-xl p-2.5 text-center border border-white/10">
-              <p className="text-lg font-bold">{profile.stats.itemsSaved}</p>
-              <p className="text-[10px] text-emerald-100 mt-0.5">Items Saved</p>
+              <p className="text-lg font-bold">{itemsSaved}</p>
+              <p className="text-[10px] text-emerald-100 mt-0.5">Items Added</p>
             </div>
             <div className="bg-white/10 rounded-xl p-2.5 text-center border border-white/10">
-              <p className="text-lg font-bold">{profile.stats.wastePreventedKg} kg</p>
+              <p className="text-lg font-bold">{wastePreventedKg}kg</p>
               <p className="text-[10px] text-emerald-100 mt-0.5">Waste Prevented</p>
             </div>
             <div className="bg-white/10 rounded-xl p-2.5 text-center border border-white/10">
-              <p className="text-lg font-bold">{profile.stats.recipesCooked}</p>
-              <p className="text-[10px] text-emerald-100 mt-0.5">Zero-Waste Meals</p>
+              <p className="text-lg font-bold">{scansTotal}</p>
+              <p className="text-[10px] text-emerald-100 mt-0.5">Products Scanned</p>
             </div>
           </div>
         </div>
 
-        <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-xs space-y-3">
-          <h3 className="text-xs font-mono font-bold text-gray-400 uppercase tracking-wider">
-            Dietary Preferences
-          </h3>
-
-          <div>
-            <label className="text-xs font-semibold text-gray-700 block mb-1.5">
-              Dietary Restrictions
-            </label>
-            <div className="grid grid-cols-3 gap-1.5">
-              {(['None', 'Vegetarian', 'Vegan', 'Gluten-Free', 'Keto', 'Halal'] as const).map((diet) => (
-                <button
-                  key={diet}
-                  onClick={() => handleUpdate('dietaryPreference', diet)}
-                  className={`py-2 px-2 rounded-xl text-xs font-mono border transition-all ${
-                    profile.dietaryPreference === diet
-                      ? 'bg-emerald-600 text-white border-emerald-600 font-bold shadow-xs'
-                      : 'bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100'
-                  }`}
-                >
-                  {diet}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="pt-2 border-t border-gray-50 flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold text-gray-800">Household Size</p>
-              <p className="text-[10px] text-gray-400">Scales recipe ingredient quantities</p>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => handleUpdate('householdSize', Math.max(1, profile.householdSize - 1))}
-                className="w-8 h-8 rounded-lg bg-gray-100 text-gray-700 font-bold text-sm"
-              >
-                -
-              </button>
-              <span className="text-xs font-mono font-bold w-4 text-center">{profile.householdSize}</span>
-              <button
-                onClick={() => handleUpdate('householdSize', profile.householdSize + 1)}
-                className="w-8 h-8 rounded-lg bg-gray-100 text-gray-700 font-bold text-sm"
-              >
-                +
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div className="bg-white rounded-2xl border border-gray-100 p-4 shadow-xs space-y-3">
-          <h3 className="text-xs font-mono font-bold text-gray-400 uppercase tracking-wider">
-            App Settings
-          </h3>
-
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold text-gray-800">Expiry Alert Buffer</p>
-              <p className="text-[10px] text-gray-400">
-                Notify when items are within {profile.expiryAlertDays} days of expiry
-              </p>
-            </div>
-            <select
-              value={profile.expiryAlertDays}
-              onChange={(e) => handleUpdate('expiryAlertDays', Number(e.target.value))}
-              className="bg-gray-50 border border-gray-200 rounded-xl py-1.5 px-3 text-xs text-gray-800 font-mono focus:outline-none"
-            >
-              <option value={1}>1 Day Before</option>
-              <option value={2}>2 Days Before</option>
-              <option value={3}>3 Days Before</option>
-              <option value={5}>5 Days Before</option>
-              <option value={7}>1 Week Before</option>
-            </select>
-          </div>
-
-          <div className="pt-2 border-t border-gray-50 flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold text-gray-800">Measurement System</p>
-              <p className="text-[10px] text-gray-400">Used for recipes & quantities</p>
-            </div>
-            <select
-              value={profile.metricSystem}
-              onChange={(e) =>
-                handleUpdate('metricSystem', e.target.value as 'Metric (g, ml)' | 'Imperial (oz, cups)')
-              }
-              className="bg-gray-50 border border-gray-200 rounded-xl py-1.5 px-3 text-xs text-gray-800 font-mono focus:outline-none"
-            >
-              <option value="Metric (g, ml)">Metric (g, ml)</option>
-              <option value="Imperial (oz, cups)">Imperial (oz, cups)</option>
-            </select>
-          </div>
-        </div>
       </div>
     </div>
   )
@@ -525,151 +695,230 @@ function ProfileScreen() {
 function ScannerScreen({
   onBack,
   onScan,
+  stopCameraRef,
 }: {
   onBack: () => void
-  onScan: (product?: ScannedProduct, detectedExpiry?: string) => void
+  onScan: (product?: ScannedProduct, expiry?: string) => void
+  stopCameraRef?: React.MutableRefObject<(() => Promise<void>) | null>
 }) {
-  const [mode, setMode] = useState<ScannerMode>('barcode')
-  const [statusText, setStatusText] = useState('Align target within frame')
-  const [processing, setProcessing] = useState(false)
+  const [statusText, setStatusText] = useState('Initializing camera...')
   const [torchOn, setTorchOn] = useState(false)
+  const [fetching, setFetching] = useState(false)
+  const scannerRef = useRef<Html5Qrcode | null>(null)
 
-  const videoRef = useRef<HTMLVideoElement | null>(null)
-  const mediaStreamRef = useRef<MediaStream | null>(null)
+  // Expose a stopCamera function to the parent so it can stop the stream
+  // before unmounting this component (prevents black screen on navigation)
+  const stopCamera = async () => {
+    const scanner = scannerRef.current
+    if (!scanner) return
+    scannerRef.current = null
+
+    // 1. Stop the html5-qrcode scanner loop
+    try {
+      if (scanner.isScanning) {
+        await scanner.stop()
+      }
+    } catch (e) {
+      console.warn('scanner.stop() error (ignored):', e)
+    }
+    try { scanner.clear() } catch {}
+
+    // 2. Hard-stop every video track inside #reader to fully release the camera.
+    //    On Android WebView, Html5Qrcode.stop() alone doesn't release the hardware.
+    try {
+      const videos = document.querySelectorAll<HTMLVideoElement>('#reader video')
+      videos.forEach((v) => {
+        try {
+          const stream = v.srcObject
+          if (stream && typeof (stream as any).getTracks === 'function') {
+            const tracks: MediaStreamTrack[] = (stream as any).getTracks()
+            if (Array.isArray(tracks)) {
+              tracks.forEach((t) => { try { t.stop() } catch {} })
+            }
+          }
+          v.srcObject = null
+          v.load()
+        } catch {}
+      })
+    } catch {}
+
+    // 3. Give the Android camera HAL time to fully release the hardware.
+    //    Without this delay, the next getUserMedia call hits NotReadableError.
+    await new Promise((r) => setTimeout(r, 400))
+  }
 
   useEffect(() => {
-    let active = true
-    let html5QrcodeScanner: Html5Qrcode | null = null
+    if (stopCameraRef) stopCameraRef.current = stopCamera
+    return () => {
+      if (stopCameraRef) stopCameraRef.current = null
+    }
+  })
 
-    async function startCamera() {
+  useEffect(() => {
+    let isMounted = true
+    let hasScanned = false  // prevent callback firing multiple times during fetch
+
+    async function startCamera(attempt = 0) {
       try {
-        const permResult = await Camera.requestPermissions({ permissions: ['camera'] })
-        if (permResult.camera !== 'granted') {
-          setStatusText('Camera permission denied.')
-          return
+        // 1. Request Capacitor Camera Permission (for mobile builds)
+        try {
+          const permResult = await Camera.requestPermissions({ permissions: ['camera'] })
+          if (permResult.camera !== 'granted') {
+            if (isMounted) setStatusText('Camera permission denied in app settings.')
+            return
+          }
+        } catch (e) {
+          // Fallback when running on standard web browser
+          console.warn('Capacitor camera request skipped on web:', e)
         }
 
-        if (mode === 'barcode') {
-          html5QrcodeScanner = new Html5Qrcode('reader')
-          await html5QrcodeScanner.start(
-            { facingMode: 'environment' },
-            { fps: 10, qrbox: { width: 220, height: 220 } },
-            async (decodedText) => {
-              if (html5QrcodeScanner) {
-                await html5QrcodeScanner.stop()
+        // 2. Short pause to guarantee the <div id="reader"> element is rendered in DOM
+        await new Promise((resolve) => setTimeout(resolve, 200))
+
+        if (!isMounted) return
+
+        // 3. Initialize Barcode Scanner Engine
+        const html5QrcodeScanner = new Html5Qrcode('reader')
+        scannerRef.current = html5QrcodeScanner
+
+        if (isMounted) setStatusText('Align barcode within frame')
+
+        await html5QrcodeScanner.start(
+          { facingMode: 'environment' }, // Back camera
+          {
+            fps: 10,
+            qrbox: { width: 240, height: 180 },
+          },
+          async (decodedText) => {
+            if (hasScanned || !isMounted) return
+            hasScanned = true
+            try {
+              if (isMounted) {
+                setFetching(true)
+                setStatusText('Looking up product...')
               }
-              setStatusText(`Found Barcode: ${decodedText}...`)
               const product = await fetchProductByBarcode(decodedText)
               onScan(product)
-            },
-            () => {},
-          )
-        }
-
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' } },
-          audio: false,
-        })
-
-        if (!active) {
-          stream.getTracks().forEach((t) => t.stop())
+            } catch (err) {
+              console.error('Barcode processing error:', err)
+              hasScanned = false
+              if (isMounted) {
+                setFetching(false)
+                setStatusText('Error looking up product. Try again.')
+              }
+            }
+          },
+          () => {} // Suppress per-frame scan errors
+        )
+      } catch (err: any) {
+        const msg = String(err?.message || err || '')
+        // NotReadableError means the camera HAL hasn't released yet — retry once
+        if (attempt === 0 && msg.includes('NotReadableError')) {
+          console.warn('Camera NotReadableError — retrying in 800ms...')
+          if (isMounted) setStatusText('Starting camera...')
+          // Clean up the failed instance before retry
+          try { scannerRef.current?.clear() } catch {}
+          scannerRef.current = null
+          await new Promise((r) => setTimeout(r, 800))
+          if (isMounted) startCamera(1)
           return
         }
-
-        mediaStreamRef.current = stream
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream
-          videoRef.current.play()
-        }
-      } catch (err) {
         console.error('Camera access error:', err)
-        setStatusText('Unable to access camera.')
+        if (isMounted) {
+          setStatusText(
+            msg.includes('Permission') || msg.includes('permission')
+              ? 'Camera permission denied. Check app settings.'
+              : 'Unable to access camera. Close other camera apps and try again.'
+          )
+        }
       }
     }
 
     startCamera()
 
+    // Teardown: stop camera cleanly when component unmounts
     return () => {
-      active = false
-      if (html5QrcodeScanner && html5QrcodeScanner.isScanning) {
-        html5QrcodeScanner.stop().catch((e) => console.error(e))
-      }
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((track) => track.stop())
-      }
+      isMounted = false
+      stopCamera()
     }
-  }, [mode])
+  }, [])
 
+  // Toggle Torch / Flashlight safely
   const toggleTorch = async () => {
-    if (!mediaStreamRef.current) return
-
-    const track = mediaStreamRef.current.getVideoTracks()[0]
-    if (!track) return
+    if (!scannerRef.current || !scannerRef.current.isScanning) return
 
     try {
-      const capabilities = track.getCapabilities() as MediaTrackCapabilities & { torch?: boolean }
-
-      if (!capabilities.torch) {
-        await Toast.show({ text: 'Torch/Flashlight not supported on this camera.' })
-        return
-      }
-
       const newTorchState = !torchOn
-      await track.applyConstraints({
+      await scannerRef.current.applyVideoConstraints({
         advanced: [{ torch: newTorchState } as MediaTrackConstraintSet],
       })
-
       setTorchOn(newTorchState)
       await Toast.show({
         text: newTorchState ? 'Flashlight Turned ON' : 'Flashlight Turned OFF',
         duration: 'short',
       })
     } catch (err) {
-      console.error('Failed to toggle torch:', err)
-      await Toast.show({ text: 'Could not switch flashlight state.' })
+      console.error('Torch error:', err)
+      await Toast.show({ text: 'Flashlight not supported on this camera.' })
     }
   }
 
-  const handleCaptureDate = async () => {
-    if (!videoRef.current || processing) return
-    setProcessing(true)
-    setStatusText('🔍 Reading printed text...')
-
+  // Pick a barcode image from the gallery and decode it
+  const pickFromGallery = async () => {
     try {
-      const canvas = document.createElement('canvas')
-      canvas.width = videoRef.current.videoWidth || 640
-      canvas.height = videoRef.current.videoHeight || 480
-      const ctx = canvas.getContext('2d')
-      if (ctx) {
-        ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height)
+      const photo = await Camera.getPhoto({
+        quality: 90,
+        allowEditing: false,
+        resultType: 'base64' as any,
+        source: 'PHOTOS' as any,
+      })
+
+      if (!photo.base64String) {
+        await Toast.show({ text: 'Could not read image from gallery.', duration: 'short' })
+        return
       }
 
-      const worker = await createWorker('eng')
-      const { data } = await worker.recognize(canvas)
-      await worker.terminate()
+      setStatusText('Reading barcode from image...')
 
-      const foundDate = extractExpiryDate(data.text)
-      setProcessing(false)
+      // Convert base64 to a File so Html5Qrcode.scanFile can accept it
+      const mimeType = photo.format === 'png' ? 'image/png' : 'image/jpeg'
+      const byteChars = atob(photo.base64String)
+      const byteNums = new Uint8Array(byteChars.length)
+      for (let i = 0; i < byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i)
+      const file = new File([byteNums], `barcode.${photo.format || 'jpg'}`, { type: mimeType })
 
-      if (foundDate) {
-        setStatusText(`Detected Date: ${foundDate}`)
-        onScan(undefined, foundDate)
-      } else {
-        setStatusText('Could not locate date pattern. Try again or edit manually.')
-        setTimeout(() => onScan(undefined, '14 OCT 2026'), 1500)
+      // Use a temporary Html5Qrcode instance just for file scanning (doesn't need a DOM element)
+      const tempScanner = new Html5Qrcode('reader-temp', { verbose: false })
+      try {
+        const decodedText = await tempScanner.scanFile(file, false)
+        setStatusText(`Found Barcode: ${decodedText}`)
+        // Stop the live camera before navigating
+        await stopCamera()
+        const product = await fetchProductByBarcode(decodedText)
+        onScan(product)
+      } catch {
+        setStatusText('No barcode found in image. Try a clearer photo.')
+        await Toast.show({ text: 'No barcode detected in that image.', duration: 'short' })
+      } finally {
+        try { tempScanner.clear() } catch {}
       }
-    } catch (err) {
-      console.error('OCR Error:', err)
-      setProcessing(false)
-      onScan(undefined, '14 OCT 2026')
+    } catch (err: any) {
+      if (!String(err).includes('cancelled') && !String(err).includes('cancel')) {
+        console.error('Gallery pick error:', err)
+        await Toast.show({ text: 'Could not open gallery.', duration: 'short' })
+      }
+      setStatusText('Align barcode within frame')
     }
   }
 
   return (
     <div className="flex flex-col h-full bg-gray-950 text-white pt-safe">
+      {/* Header */}
       <div className="flex items-center justify-between px-5 pt-4 pb-4 shrink-0 z-10">
-        <button onClick={onBack} className="text-sm text-white/70 hover:text-white">← Back</button>
-        <p className="text-[11px] font-mono text-emerald-400">{mode === 'barcode' ? 'Barcode Mode' : 'Expiry OCR Mode'}</p>
+        <button onClick={onBack} className="text-sm text-white/70 hover:text-white">
+          ← Back
+        </button>
+        <p className="text-[11px] font-mono text-emerald-400">Barcode Scanner</p>
         <button
           onClick={toggleTorch}
           className={`p-2.5 rounded-full border transition-all ${
@@ -683,47 +932,34 @@ function ScannerScreen({
         </button>
       </div>
 
-      <div className="flex-1 flex flex-col items-center justify-center px-6">
-        <div className="relative w-full max-w-[270px] aspect-square rounded-3xl overflow-hidden bg-black border border-white/10">
-          {mode === 'barcode' ? (
-            <div id="reader" className="w-full h-full object-cover" />
-          ) : (
-            <video ref={videoRef} playsInline muted className="absolute inset-0 w-full h-full object-cover" />
+      {/* Viewport */}
+      <div className="flex-1 flex flex-col items-center justify-center px-6 gap-5">
+        <div className="relative w-full max-w-[270px] aspect-square rounded-3xl overflow-hidden bg-black border border-white/10 shadow-2xl">
+          <div id="reader" className="w-full h-full object-cover" />
+          {/* Hidden temp element for gallery scan */}
+          <div id="reader-temp" style={{ display: 'none' }} />
+          {/* Loading overlay while fetching product info */}
+          {fetching && (
+            <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center gap-3 rounded-3xl">
+              <span className="text-3xl animate-bounce">🔍</span>
+              <p className="text-xs font-mono text-emerald-400 text-center px-4">Looking up product...</p>
+            </div>
           )}
-          <div className="absolute left-4 right-4 h-px bg-emerald-400 z-10"
-            style={{ boxShadow: '0 0 16px 4px rgba(52,211,153,0.7)', animation: 'scanline 1.8s ease-in-out infinite' }} />
         </div>
-        <p className="text-white/70 text-xs mt-4 text-center font-mono">{statusText}</p>
-      </div>
+        <p className="text-xs font-mono text-white/60 text-center px-4">{statusText}</p>
 
-      <div className="px-5 pb-6 shrink-0 pb-safe">
-        <div className="flex bg-white/10 rounded-full p-1 mb-4 border border-white/10">
-          {(['barcode', 'expiry'] as ScannerMode[]).map((m) => (
-            <button key={m} onClick={() => setMode(m)}
-              className={`flex-1 py-2.5 rounded-full text-[11px] font-mono transition-all ${mode === m ? 'bg-white text-gray-900 font-semibold shadow-sm' : 'text-white/40'}`}>
-              {m === 'barcode' ? '[ Barcode Scanner ]' : '[ Expiry Date OCR ]'}
-            </button>
-          ))}
-        </div>
-
-        {mode === 'expiry' ? (
-          <button onClick={handleCaptureDate} disabled={processing}
-            className="w-full py-4 rounded-2xl font-semibold text-base transition-all active:scale-[0.97]"
-            style={{ background: 'linear-gradient(135deg, #059669, #10b981)', color: 'white' }}>
-            {processing ? 'Reading Text...' : '📷 Capture & Read Expiry Date'}
-          </button>
-        ) : (
-          <button onClick={() => onScan()}
-            className="w-full py-4 rounded-2xl font-semibold text-base transition-all active:scale-[0.97]"
-            style={{ background: 'linear-gradient(135deg, #059669, #10b981)', color: 'white' }}>
-            Tap to Scan Barcode
-          </button>
-        )}
+        {/* Gallery import button */}
+        <button
+          onClick={pickFromGallery}
+          className="flex items-center gap-2.5 px-5 py-3 rounded-2xl border border-white/15 bg-white/8 hover:bg-white/15 active:scale-[0.97] transition-all"
+        >
+          <span className="text-lg leading-none">🖼️</span>
+          <span className="text-sm font-semibold text-white/80">Import from Gallery</span>
+        </button>
       </div>
     </div>
   )
 }
-
 // ─── Verdict ──────────────────────────────────────────────────────────────────
 
 function VerdictScreen({
@@ -741,19 +977,52 @@ function VerdictScreen({
   const [date, setDate] = useState(detectedExpiry || '14 OCT 2026')
   const [showIngredients, setShowIngredients] = useState(true)
 
-  const profileFlags: string[] = JSON.parse(
-    localStorage.getItem('nutrilyst_profile') || '["Diabetes (Type 2)", "Gluten / Wheat"]'
-  )
+  const profileFlags: string[] = (() => {
+    try {
+      const raw = localStorage.getItem('nutrilyst_profile')
+      if (!raw) return []
+      const parsed = JSON.parse(raw)
+      // Build flat flags array from all three profile fields
+      const diets = Array.isArray(parsed.dietaryPreferences) ? parsed.dietaryPreferences : []
+      const allergies = Array.isArray(parsed.allergies) ? parsed.allergies : []
+      const conditions = Array.isArray(parsed.healthConditions) ? parsed.healthConditions : []
+      return [...diets, ...allergies, ...conditions]
+    } catch {
+      return []
+    }
+  })()
 
-  const product: ScannedProduct = scannedProduct || {
-    barcode: '00000000',
-    name: 'Whole Grain Cranberry Granola Crisp',
-    brand: "Nature's Crunch",
-    category: 'Breakfast Cereals',
-    ingredients: 'Whole grain oats, sugar, dried cranberries, high fructose corn syrup, palm oil',
-    emoji: '🥣',
-    nutrients: { calories: 280, sugars: 24, sodium: 620, saturatedFat: 2.5 },
+  // ── Empty state: no product scanned yet ──────────────────────────────────
+  if (!scannedProduct) {
+    return (
+      <div className="flex flex-col h-full bg-[#F7FAF8] pt-safe">
+        <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-4">
+          <p className="text-[10px] font-mono tracking-widest text-gray-400">SCAN RESULT</p>
+          <h2 className="text-lg font-bold text-gray-900 mt-0.5">No Product Scanned</h2>
+        </div>
+        <div className="flex-1 flex flex-col items-center justify-center px-8 gap-5">
+          <div className="w-20 h-20 rounded-3xl bg-emerald-50 border border-emerald-100 flex items-center justify-center text-4xl">
+            📷
+          </div>
+          <div className="text-center space-y-1.5">
+            <h3 className="text-base font-bold text-gray-800">Scan a product first</h3>
+            <p className="text-sm text-gray-400 leading-relaxed">
+              Point your camera at a barcode to get a full nutrition &amp; health analysis tailored to your profile.
+            </p>
+          </div>
+          <button
+            onClick={onBack}
+            className="w-full py-4 rounded-2xl font-semibold text-base text-white active:scale-[0.98] transition-all"
+            style={{ background: 'linear-gradient(135deg, #065f46, #059669)', boxShadow: '0 4px 16px rgba(6,95,70,0.25)' }}
+          >
+            📷 Open Scanner
+          </button>
+        </div>
+      </div>
+    )
   }
+
+  const product = scannedProduct
 
   const evaluation = evaluateProductHealth(product, profileFlags)
   const cfg = VERDICT_CONFIG[evaluation.variant]
@@ -783,7 +1052,7 @@ function VerdictScreen({
   }
 
   return (
-    <div className="flex flex-col h-full bg-[#F7FAF8]">
+    <div className="flex flex-col h-full bg-[#F7FAF8] pt-safe">
       <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-4">
         <button onClick={onBack} className="text-sm text-gray-400 hover:text-gray-700 transition-colors mb-3 block">← Back to Scanner</button>
         <div className="flex items-start gap-3">
@@ -890,7 +1159,7 @@ function AddItemScreen({ onBack, onSave }: { onBack: () => void; onSave: (item: 
   }
 
   return (
-    <div className="flex flex-col h-full bg-[#F7FAF8]">
+    <div className="flex flex-col h-full bg-[#F7FAF8] pt-safe">
       <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-5">
         <button onClick={onBack} className="text-sm text-gray-400 hover:text-gray-700 transition-colors mb-3 block">← Back</button>
         <h2 className="text-xl font-bold text-gray-900">Add Pantry Item</h2>
@@ -1038,7 +1307,7 @@ function PantryScreen({ items, setItems, onRecipes, onAddItem }: {
   const moderateCount = items.filter((item) => item.expiryLevel === 'moderate').length
 
   return (
-    <div className="flex flex-col h-full bg-[#F7FAF8]">
+    <div className="flex flex-col h-full bg-[#F7FAF8] pt-safe">
       <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-3 pt-safe">
         <div className="flex items-center justify-between mb-2">
           <div>
@@ -1227,7 +1496,7 @@ function ShoppingListScreen({ pantryItems }: { pantryItems: PantryItem[] }) {
   }
 
   return (
-    <div className="flex flex-col h-full bg-[#F7FAF8]">
+    <div className="flex flex-col h-full bg-[#F7FAF8] pt-safe">
       <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-4 pt-safe">
         <p className="text-[10px] font-mono tracking-widest text-emerald-600 mb-0.5">
           AUTOMATED RESTOCKING
@@ -1323,7 +1592,7 @@ function AutomaticRecipesScreen({ pantryItems }: { pantryItems: PantryItem[] }) 
   )
 
   return (
-    <div className="flex flex-col h-full bg-[#F7FAF8]">
+    <div className="flex flex-col h-full bg-[#F7FAF8] pt-safe">
       <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-4 pt-safe">
         <p className="text-[10px] font-mono tracking-widest text-emerald-600 mb-0.5">
           AI-POWERED ZERO-WASTE
@@ -1462,7 +1731,7 @@ function RecipesScreen({ pantryItems }: { pantryItems: PantryItem[] }) {
   ).length
 
   return (
-    <div className="flex flex-col h-full bg-[#F7FAF8]">
+    <div className="flex flex-col h-full bg-[#F7FAF8] pt-safe">
       <div className="bg-white border-b border-gray-100 px-5 pt-4 pb-4 pt-safe">
         <div className="flex items-center justify-between">
           <div>
@@ -1598,35 +1867,50 @@ export default function App() {
     const saved = localStorage.getItem('nutrilyst_pantry')
     return saved ? JSON.parse(saved) : INITIAL_PANTRY
   })
+  // Track scans done this session
+  const [scansToday, setScansToday] = useState(0)
+  // Load profile for name display — re-read on focus so edits in ProfileScreen reflect immediately
+  const [profileName, setProfileName] = useState(() => loadUserProfile().name)
+
+  // Ref to the scanner's stopCamera function — populated while ScannerScreen is mounted
+  const stopCameraRef = useRef<(() => Promise<void>) | null>(null)
 
   useEffect(() => {
     localStorage.setItem('nutrilyst_pantry', JSON.stringify(pantryItems))
   }, [pantryItems])
 
+  // Refresh profile name whenever the user navigates back from profile screen
+  useEffect(() => {
+    if (screen === 'dashboard') {
+      setProfileName(loadUserProfile().name)
+    }
+  }, [screen])
+
+  // Always stop camera before leaving scanner screen to prevent black screen
+  const navigateTo = async (target: Screen) => {
+    if (screen === 'scanner' && stopCameraRef.current) {
+      await stopCameraRef.current()
+    }
+    setScreen(target)
+  }
+
   const isDark = screen === 'scanner'
 
   return (
-    <div className="min-h-screen bg-gray-300 flex items-center justify-center p-4">
-      <div className="relative bg-white shadow-2xl overflow-hidden flex flex-col"
-        style={{ width: '100%', maxWidth: 390, height: 844, borderRadius: 44, boxShadow: '0 48px 96px -24px rgba(0,0,0,0.4), 0 0 0 1px rgba(0,0,0,0.06)' }}>
-        {/* Status bar */}
-        <div className={`shrink-0 flex items-center justify-between px-7 pt-3 pb-2 ${isDark ? 'bg-gray-950' : screen === 'dashboard' ? '' : 'bg-white'}`}
-          style={screen === 'dashboard' ? { background: 'linear-gradient(145deg, #064e3b, #065f46)' } : {}}>
-          <span className={`text-xs font-mono font-semibold ${isDark || screen === 'dashboard' ? 'text-white/60' : 'text-gray-800'}`}>9:41</span>
-          <div className={`w-24 h-[22px] rounded-full ${isDark || screen === 'dashboard' ? 'bg-black/40' : 'bg-gray-900'}`} />
-          <div className={`text-xs font-mono ${isDark || screen === 'dashboard' ? 'text-white/60' : 'text-gray-800'}`}>●●●</div>
-        </div>
-
+    <div className="relative w-full h-full flex flex-col overflow-hidden" style={{ background: isDark ? '#030712' : '#ffffff' }}>
         {/* Screen */}
         <div className="flex-1 overflow-hidden">
-          {screen === 'dashboard' && <DashboardScreen items={pantryItems} onNav={setScreen} />}
-          {screen === 'profile' && <ProfileScreen />}
+          {screen === 'dashboard' && <DashboardScreen items={pantryItems} onNav={(s) => navigateTo(s)} userName={profileName} scansToday={scansToday} />}
+          {screen === 'profile' && <ProfileScreen pantryItemCount={pantryItems.length} scansTotal={scansToday} />}
           {screen === 'scanner' && (
             <ScannerScreen
-              onBack={() => setScreen('dashboard')}
-              onScan={(product, expiry) => {
+              stopCameraRef={stopCameraRef}
+              onBack={() => navigateTo('dashboard')}
+              onScan={async (product, expiry) => {
+                if (stopCameraRef.current) await stopCameraRef.current()
                 setScannedProduct(product)
                 setDetectedExpiry(expiry)
+                setScansToday((n) => n + 1)
                 setScreen('verdict')
               }}
             />
@@ -1670,7 +1954,7 @@ export default function App() {
             {NAV.map(({ id, label, icon }) => {
               const active = screen === id
               return (
-                <button key={id} onClick={() => setScreen(id)} className="flex-1 pt-2.5 flex flex-col items-center gap-0.5 transition-all">
+                <button key={id} onClick={() => navigateTo(id)} className="flex-1 pt-2.5 flex flex-col items-center gap-0.5 transition-all">
                   <span className={`text-lg transition-transform ${active ? 'scale-110' : 'opacity-35 scale-100'}`}>{icon}</span>
                   <span className={`text-[9px] font-mono font-semibold ${active ? (isDark ? 'text-emerald-400' : 'text-emerald-700') : (isDark ? 'text-white/30' : 'text-gray-400')}`}>{label}</span>
                 </button>
@@ -1678,7 +1962,6 @@ export default function App() {
             })}
           </div>
         )}
-      </div>
     </div>
   )
 }
